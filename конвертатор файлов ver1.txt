@@ -1,0 +1,209 @@
+import os
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from PIL import Image
+import tempfile
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+user_data = {}
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📸 JPG → PNG", callback_data='jpg_to_png')],
+        [InlineKeyboardButton("📄 TXT → PDF", callback_data='txt_to_pdf')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    
+    await update.message.reply_text(
+        "🔄 Бот для конвертации файлов\n\nВыберите тип конвертации:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📸 JPG → PNG", callback_data='jpg_to_png')],
+        [InlineKeyboardButton("📄 TXT → PDF", callback_data='txt_to_pdf')],
+        [InlineKeyboardButton("⬅️ Назад", callback_data='back')]
+    ]
+    
+    await update.message.reply_text(
+        "Что умеет:\n• JPG → PNG (до 20 МБ)\n• TXT → PDF (до 10 МБ)\n\nКак использовать:\n1. Выберите тип\n2. Отправьте файл\n3. Получите результат",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in user_data:
+        del user_data[user_id]
+    await update.message.reply_text("Отменено.")
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    
+    if query.data == 'help':
+        keyboard = [
+            [InlineKeyboardButton("📸 JPG → PNG", callback_data='jpg_to_png')],
+            [InlineKeyboardButton("📄 TXT → PDF", callback_data='txt_to_pdf')],
+            [InlineKeyboardButton("⬅️ Назад", callback_data='back')]
+        ]
+        
+        await query.edit_message_text(
+            "Что умеет:\n• JPG → PNG (до 20 МБ)\n• TXT → PDF (до 10 МБ)\n\nКак использовать:\n1. Выберите тип\n2. Отправьте файл\n3. Получите результат",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif query.data == 'back':
+        keyboard = [
+            [InlineKeyboardButton("📸 JPG → PNG", callback_data='jpg_to_png')],
+            [InlineKeyboardButton("📄 TXT → PDF", callback_data='txt_to_pdf')],
+            [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+        ]
+        
+        await query.edit_message_text(
+            "🔄 Бот для конвертации файлов\n\nВыберите тип конвертации:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    
+    elif query.data == 'jpg_to_png':
+        user_data[user_id] = {'type': 'jpg_to_png', 'source': 'jpg', 'target': 'png', 'max_size': 20 * 1024 * 1024}
+        await query.edit_message_text("📸 JPG → PNG\n\nОтправьте JPG файл (до 20 МБ).\n/cancel - отмена")
+    
+    elif query.data == 'txt_to_pdf':
+        user_data[user_id] = {'type': 'txt_to_pdf', 'source': 'txt', 'target': 'pdf', 'max_size': 10 * 1024 * 1024}
+        await query.edit_message_text("📄 TXT → PDF\n\nОтправьте TXT файл (до 10 МБ).\n/cancel - отмена")
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    
+    if user_id not in user_data:
+        keyboard = [
+            [InlineKeyboardButton("📸 JPG → PNG", callback_data='jpg_to_png')],
+            [InlineKeyboardButton("📄 TXT → PDF", callback_data='txt_to_pdf')]
+        ]
+        await update.message.reply_text("Сначала выберите тип конвертации.", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+    
+    user_info = user_data[user_id]
+    
+    if update.message.document:
+        doc = update.message.document
+        file_name = doc.file_name or f"file.{user_info['source']}"
+        file_ext = file_name.split('.')[-1].lower()
+        
+        if file_ext != user_info['source']:
+            keyboard = [
+                [InlineKeyboardButton("📸 JPG → PNG", callback_data='jpg_to_png')],
+                [InlineKeyboardButton("📄 TXT → PDF", callback_data='txt_to_pdf')]
+            ]
+            await update.message.reply_text(f"❌ Нужен файл .{user_info['source']}, а не .{file_ext}", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+        
+        if doc.file_size and doc.file_size > user_info['max_size']:
+            max_mb = user_info['max_size'] // (1024 * 1024)
+            await update.message.reply_text(f"❌ Файл слишком большой. Максимум: {max_mb} МБ.")
+            return
+        
+        file = await doc.get_file()
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = os.path.join(tmp_dir, f"input.{user_info['source']}")
+            output_path = os.path.join(tmp_dir, f"output.{user_info['target']}")
+            
+            await file.download_to_drive(input_path)
+            
+            status_msg = await update.message.reply_text("⏳ Конвертация...")
+            
+            try:
+                if user_info['type'] == 'jpg_to_png':
+                    with Image.open(input_path) as img:
+                        img.save(output_path, format='PNG')
+                elif user_info['type'] == 'txt_to_pdf':
+                    from fpdf import FPDF
+                    pdf = FPDF()
+                    pdf.add_page()
+                    pdf.set_font("Arial", size=12)
+                    
+                    encodings = ['utf-8', 'cp1251', 'iso-8859-1', 'cp866']
+                    text = None
+                    
+                    for encoding in encodings:
+                        try:
+                            with open(input_path, 'r', encoding=encoding) as f:
+                                text = f.read()
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    
+                    if text is None:
+                        raise Exception("Не удалось прочитать файл")
+                    
+                    for line in text.split('\n'):
+                        if len(line) > 100:
+                            chunks = [line[i:i+100] for i in range(0, len(line), 100)]
+                            for chunk in chunks:
+                                pdf.cell(200, 10, txt=chunk, ln=True)
+                        else:
+                            pdf.cell(200, 10, txt=line, ln=True)
+                    
+                    pdf.output(output_path)
+                
+                with open(output_path, 'rb') as f:
+                    await update.message.reply_document(
+                        document=f,
+                        filename=f"converted.{user_info['target']}",
+                        caption=f"✅ Готово!",
+                        read_timeout=120,
+                        write_timeout=120,
+                        connect_timeout=60
+                    )
+                
+                await status_msg.delete()
+                del user_data[user_id]
+                
+                keyboard = [
+                    [InlineKeyboardButton("📸 JPG → PNG", callback_data='jpg_to_png')],
+                    [InlineKeyboardButton("📄 TXT → PDF", callback_data='txt_to_pdf')]
+                ]
+                await update.message.reply_text("Что дальше?", reply_markup=InlineKeyboardMarkup(keyboard))
+                
+            except Exception as e:
+                logger.error(f"Ошибка: {e}")
+                await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+                if 'status_msg' in locals():
+                    try:
+                        await status_msg.delete()
+                    except:
+                        pass
+    else:
+        await update.message.reply_text("❌ Отправьте файл как документ.")
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text and not update.message.text.startswith('/'):
+        await start(update, context)
+
+def main():
+    TOKEN = "ВАШ_ТОКЕН_БОТА"
+    
+    application = Application.builder().token(TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    print("Бот запущен")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
