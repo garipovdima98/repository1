@@ -1,0 +1,2802 @@
+import os
+import sys
+import json
+import time
+import logging
+import asyncio
+import aiohttp
+import sqlite3
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List, Any, Tuple
+from collections import defaultdict
+from functools import wraps
+from pathlib import Path
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+from PIL import Image
+import io
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import simpleSplit
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+import mimetypes
+import hashlib
+import re
+
+# ==================== НАСТРОЙКА ЛОГИРОВАНИЯ ====================
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==================== КОНСТАНТЫ ====================
+
+TOKEN =
+ADMIN_IDS = [5277965812]  # Замените на ваш Telegram ID
+DB_PATH = "bot_database.db"
+
+# Максимальная длительность видео для конвертации в GIF (4 минуты = 240 секунд)
+MAX_GIF_DURATION = 240
+
+# ==================== ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ====================
+
+class Database:
+    """Класс для работы с базой данных SQLite"""
+    
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self._init_db()
+    
+    def _init_db(self):
+        """Инициализация таблиц"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            # Таблица пользователей
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    joined_date TIMESTAMP,
+                    last_activity TIMESTAMP,
+                    total_conversions INTEGER DEFAULT 0,
+                    total_files INTEGER DEFAULT 0,
+                    is_banned INTEGER DEFAULT 0,
+                    ban_reason TEXT,
+                    banned_date TIMESTAMP,
+                    banned_by INTEGER
+                )
+            ''')
+            
+            # Таблица конвертаций
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS conversions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    conversion_type TEXT,
+                    source_format TEXT,
+                    target_format TEXT,
+                    file_size INTEGER,
+                    success INTEGER DEFAULT 0,
+                    error_message TEXT,
+                    timestamp TIMESTAMP,
+                    duration_ms INTEGER,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            ''')
+            
+            # Таблица логов действий
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    action TEXT,
+                    details TEXT,
+                    timestamp TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id)
+                )
+            ''')
+            
+            # Таблица банов (история)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    admin_id INTEGER,
+                    reason TEXT,
+                    banned_date TIMESTAMP,
+                    unbanned_date TIMESTAMP,
+                    is_active INTEGER DEFAULT 1,
+                    FOREIGN KEY (user_id) REFERENCES users(user_id),
+                    FOREIGN KEY (admin_id) REFERENCES users(user_id)
+                )
+            ''')
+            
+            conn.commit()
+    
+    # ========== ПОЛЬЗОВАТЕЛИ ==========
+    
+    def add_user(self, user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+        """Добавление или обновление пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO users (user_id, username, first_name, last_name, joined_date, last_activity)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = excluded.username,
+                    first_name = excluded.first_name,
+                    last_name = excluded.last_name,
+                    last_activity = excluded.last_activity
+            ''', (user_id, username, first_name, last_name, datetime.now(), datetime.now()))
+            conn.commit()
+    
+    def update_activity(self, user_id: int):
+        """Обновление времени последней активности"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE users SET last_activity = ? WHERE user_id = ?
+            ''', (datetime.now(), user_id))
+            conn.commit()
+    
+    def get_user(self, user_id: int) -> Optional[Dict]:
+        """Получение информации о пользователе"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT user_id, username, first_name, last_name, joined_date, last_activity,
+                       total_conversions, total_files, is_banned, ban_reason
+                FROM users WHERE user_id = ?
+            ''', (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'user_id': row[0],
+                    'username': row[1],
+                    'first_name': row[2],
+                    'last_name': row[3],
+                    'joined_date': row[4],
+                    'last_activity': row[5],
+                    'total_conversions': row[6],
+                    'total_files': row[7],
+                    'is_banned': row[8],
+                    'ban_reason': row[9]
+                }
+            return None
+    
+    # ========== БАНЫ ==========
+    
+    def is_banned(self, user_id: int) -> bool:
+        """Проверка, заблокирован ли пользователь"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT is_banned FROM users WHERE user_id = ?', (user_id,))
+            result = cursor.fetchone()
+            return result is not None and result[0] == 1
+    
+    def ban_user(self, user_id: int, admin_id: int, reason: str = None):
+        """Блокировка пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE users SET 
+                    is_banned = 1, 
+                    ban_reason = ?, 
+                    banned_date = ?,
+                    banned_by = ?
+                WHERE user_id = ?
+            ''', (reason, datetime.now(), admin_id, user_id))
+            
+            cursor.execute('''
+                INSERT INTO bans (user_id, admin_id, reason, banned_date, is_active)
+                VALUES (?, ?, ?, ?, 1)
+            ''', (user_id, admin_id, reason, datetime.now()))
+            
+            conn.commit()
+    
+    def unban_user(self, user_id: int):
+        """Разблокировка пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE users SET is_banned = 0, ban_reason = NULL, banned_date = NULL, banned_by = NULL
+                WHERE user_id = ?
+            ''', (user_id,))
+            
+            cursor.execute('''
+                UPDATE bans SET is_active = 0, unbanned_date = ? 
+                WHERE user_id = ? AND is_active = 1
+            ''', (datetime.now(), user_id))
+            
+            conn.commit()
+    
+    def get_banned_users(self) -> List[Dict]:
+        """Получение списка заблокированных пользователей"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT user_id, username, first_name, last_name, ban_reason, banned_date
+                FROM users WHERE is_banned = 1
+                ORDER BY banned_date DESC
+            ''')
+            users = []
+            for row in cursor.fetchall():
+                users.append({
+                    'user_id': row[0],
+                    'username': row[1],
+                    'first_name': row[2],
+                    'last_name': row[3],
+                    'ban_reason': row[4],
+                    'banned_date': row[5]
+                })
+            return users
+    
+    # ========== КОНВЕРТАЦИИ ==========
+    
+    def log_conversion(self, user_id: int, conv_type: str, source: str, target: str,
+                      file_size: int, success: bool, error: str = None, duration: int = 0):
+        """Логирование конвертации"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO conversions 
+                (user_id, conversion_type, source_format, target_format, file_size, success, 
+                 error_message, timestamp, duration_ms)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, conv_type, source, target, file_size, 1 if success else 0, 
+                  error, datetime.now(), duration))
+            
+            if success:
+                cursor.execute('''
+                    UPDATE users SET 
+                        total_conversions = total_conversions + 1, 
+                        total_files = total_files + 1
+                    WHERE user_id = ?
+                ''', (user_id,))
+            
+            conn.commit()
+    
+    def get_user_stats(self, user_id: int) -> Dict:
+        """Получение статистики пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT total_conversions, total_files, joined_date, last_activity
+                FROM users WHERE user_id = ?
+            ''', (user_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                return {
+                    'total_conversions': row[0],
+                    'total_files': row[1],
+                    'joined_date': row[2],
+                    'last_activity': row[3]
+                }
+            return {}
+    
+    def get_total_stats(self) -> Dict:
+        """Получение общей статистики"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT 
+                    COUNT(DISTINCT user_id) as total_users,
+                    SUM(total_conversions) as total_conversions,
+                    SUM(total_files) as total_files,
+                    AVG(total_conversions) as avg_conversions
+                FROM users WHERE is_banned = 0
+            ''')
+            stats = cursor.fetchone()
+            
+            cursor.execute('SELECT COUNT(*) FROM users WHERE is_banned = 1')
+            banned_count = cursor.fetchone()[0]
+            
+            today = datetime.now().date()
+            cursor.execute('''
+                SELECT COUNT(*) FROM conversions 
+                WHERE date(timestamp) = date(?)
+            ''', (today,))
+            today_conversions = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                SELECT 
+                    SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) as success,
+                    SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) as failed
+                FROM conversions
+            ''')
+            success_stats = cursor.fetchone()
+            
+            return {
+                'total_users': stats[0] or 0,
+                'total_conversions': stats[1] or 0,
+                'total_files': stats[2] or 0,
+                'avg_conversions': round(stats[3] or 0, 1),
+                'banned_users': banned_count,
+                'today_conversions': today_conversions or 0,
+                'successful_conversions': success_stats[0] or 0,
+                'failed_conversions': success_stats[1] or 0
+            }
+    
+    def get_recent_conversions(self, limit: int = 10) -> List[Dict]:
+        """Получение последних конвертаций"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT c.user_id, u.username, u.first_name, c.conversion_type, 
+                       c.source_format, c.target_format, c.success, c.timestamp
+                FROM conversions c
+                JOIN users u ON c.user_id = u.user_id
+                ORDER BY c.timestamp DESC LIMIT ?
+            ''', (limit,))
+            
+            conversions = []
+            for row in cursor.fetchall():
+                conversions.append({
+                    'user_id': row[0],
+                    'username': row[1] or f"ID: {row[0]}",
+                    'first_name': row[2],
+                    'conversion_type': row[3],
+                    'source': row[4],
+                    'target': row[5],
+                    'success': row[6],
+                    'timestamp': row[7]
+                })
+            return conversions
+    
+    def get_top_users(self, limit: int = 5) -> List[Dict]:
+        """Получение топ пользователей"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT user_id, username, first_name, total_conversions, total_files
+                FROM users
+                WHERE is_banned = 0 AND total_conversions > 0
+                ORDER BY total_conversions DESC
+                LIMIT ?
+            ''', (limit,))
+            
+            users = []
+            for row in cursor.fetchall():
+                users.append({
+                    'user_id': row[0],
+                    'username': row[1] or f"ID: {row[0]}",
+                    'first_name': row[2],
+                    'total_conversions': row[3],
+                    'total_files': row[4]
+                })
+            return users
+    
+    # ========== ЛОГИ ==========
+    
+    def log_action(self, user_id: int, action: str, details: str = None):
+        """Логирование действия пользователя"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO logs (user_id, action, details, timestamp)
+                VALUES (?, ?, ?, ?)
+            ''', (user_id, action, details, datetime.now()))
+            conn.commit()
+    
+    def get_all_logs(self, limit: int = 50) -> List[Dict]:
+        """Получение всех последних логов"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT l.user_id, u.username, l.action, l.details, l.timestamp
+                FROM logs l
+                JOIN users u ON l.user_id = u.user_id
+                ORDER BY l.timestamp DESC
+                LIMIT ?
+            ''', (limit,))
+            
+            logs = []
+            for row in cursor.fetchall():
+                logs.append({
+                    'user_id': row[0],
+                    'username': row[1] or f"ID: {row[0]}",
+                    'action': row[2],
+                    'details': row[3],
+                    'timestamp': row[4]
+                })
+            return logs
+
+# ==================== ИНИЦИАЛИЗАЦИЯ БД ====================
+
+db = Database(DB_PATH)
+
+# ==================== ДЕКОРАТОР ДЛЯ ПРОВЕРКИ БАНА ====================
+
+def check_ban(func):
+    """Декоратор для проверки, не заблокирован ли пользователь"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        
+        if db.is_banned(user_id):
+            user = db.get_user(user_id)
+            ban_reason = user.get('ban_reason', 'Не указана') if user else 'Не указана'
+            await update.message.reply_text(
+                "⛔ Доступ заблокирован\n\n"
+                f"Ваш аккаунт был заблокирован администратором.\n"
+                f"Причина: {ban_reason}\n\n"
+                f"Если вы считаете это ошибкой, свяжитесь с поддержкой."
+            )
+            return
+        
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+def check_ban_callback(func):
+    """Декоратор для проверки бана в callback-запросах"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user_id = update.effective_user.id
+        
+        if db.is_banned(user_id):
+            await update.callback_query.answer("⛔ Вы заблокированы!", show_alert=True)
+            return
+        
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# ==================== ОНЛАЙН КОНВЕРТЕР ====================
+
+# ==================== ОНЛАЙН КОНВЕРТЕР ====================
+
+class OnlineConverter:
+    """Конвертер для видео и аудио через онлайн-сервисы"""
+    
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.conversion_history = []
+        self.failed_attempts = defaultdict(int)
+        
+    async def __aenter__(self):
+        # Увеличиваем таймаут для обработки больших видео (до 5 минут)
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=300, sock_read=120, sock_connect=30),
+            headers={
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+        )
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    async def convert_file(self, file_bytes: bytes, from_format: str, to_format: str, 
+                          filename: str = "file") -> bytes:
+        """Конвертация файла через доступные онлайн-сервисы"""
+        
+        methods = [
+            self._convert_via_cloudconvert,
+            self._convert_via_ezgif,
+            self._convert_via_onlineconvertfree,
+        ]
+        
+        max_size_mb = 50
+        if len(file_bytes) > max_size_mb * 1024 * 1024:
+            raise Exception(f"Файл слишком большой. Максимум: {max_size_mb} МБ")
+        
+        last_error = None
+        for method in methods:
+            try:
+                logger.info(f"Пробуем метод {method.__name__} для {from_format}->{to_format}")
+                result = await method(file_bytes, from_format, to_format, filename)
+                
+                if result and len(result) > 100:
+                    self.conversion_history.append({
+                        'timestamp': time.time(),
+                        'from': from_format,
+                        'to': to_format,
+                        'size': len(file_bytes),
+                        'method': method.__name__
+                    })
+                    self.failed_attempts[method.__name__] = 0
+                    return result
+                    
+            except asyncio.TimeoutError:
+                logger.warning(f"Таймаут метода {method.__name__}")
+                last_error = "Превышено время ожидания (видео слишком длинное)"
+                self.failed_attempts[method.__name__] += 1
+                continue
+            except Exception as e:
+                logger.warning(f"Метод {method.__name__} не сработал: {e}")
+                last_error = str(e)
+                self.failed_attempts[method.__name__] += 1
+                continue
+        
+        raise Exception(f"❌ Онлайн-сервисы временно недоступны. Последняя ошибка: {last_error}")
+    
+    async def _convert_via_cloudconvert(self, file_bytes: bytes, from_format: str, 
+                                       to_format: str, filename: str) -> bytes:
+        """Конвертация через CloudConvert (бесплатно, без ключа)"""
+        
+        # 1. Создаем задачу
+        job_url = "https://api.cloudconvert.com/v2/jobs"
+        
+        job_data = {
+            "tasks": {
+                "upload-my-file": {
+                    "operation": "import/upload"
+                },
+                "convert-my-file": {
+                    "operation": "convert",
+                    "input": ["upload-my-file"],
+                    "output_format": to_format,
+                    "input_format": from_format,
+                    "engine": "ffmpeg" if from_format in ['mp4', 'mov', 'avi', 'gif'] else "office",
+                    "filename": f"{filename}.{to_format}"
+                },
+                "export-my-file": {
+                    "operation": "export/url",
+                    "input": ["convert-my-file"]
+                }
+            }
+        }
+        
+        async with self.session.post(job_url, json=job_data) as resp:
+            if resp.status not in [200, 201]:
+                raise Exception(f"Ошибка создания задачи: {resp.status}")
+            
+            job = await resp.json()
+            job_id = job['data']['id']
+        
+        # 2. Получаем URL для загрузки
+        task_url = f"https://api.cloudconvert.com/v2/tasks"
+        async with self.session.get(task_url) as resp:
+            if resp.status != 200:
+                raise Exception("Не удалось получить задачу")
+            
+            tasks = await resp.json()
+            upload_task = None
+            for task in tasks['data']:
+                if task['job_id'] == job_id and task['operation'] == 'import/upload':
+                    upload_task = task
+                    break
+            
+            if not upload_task:
+                raise Exception("Не найдена задача загрузки")
+            
+            upload_url = upload_task['result']['form']['url']
+            upload_params = upload_task['result']['form']['parameters']
+        
+        # 3. Загружаем файл
+        form_data = aiohttp.FormData()
+        for key, value in upload_params.items():
+            form_data.add_field(key, value)
+        form_data.add_field('file', file_bytes, filename=f'{filename}.{from_format}')
+        
+        async with self.session.post(upload_url, data=form_data) as resp:
+            if resp.status not in [200, 201, 204]:
+                raise Exception(f"Ошибка загрузки файла: {resp.status}")
+        
+        # 4. Ждем завершения конвертации
+        for _ in range(60):  # Максимум 60 попыток (5 минут)
+            await asyncio.sleep(5)
+            
+            async with self.session.get(f"https://api.cloudconvert.com/v2/jobs/{job_id}") as resp:
+                if resp.status != 200:
+                    continue
+                
+                job_status = await resp.json()
+                status = job_status['data']['status']
+                
+                if status == 'finished':
+                    # Получаем URL для скачивания
+                    for task in job_status['data']['tasks']:
+                        if task['operation'] == 'export/url' and task['status'] == 'finished':
+                            files = task['result'].get('files', [])
+                            if files:
+                                download_url = files[0].get('url')
+                                if download_url:
+                                    async with self.session.get(download_url) as download_resp:
+                                        if download_resp.status == 200:
+                                            return await download_resp.read()
+                    break
+                elif status == 'error':
+                    raise Exception("Ошибка конвертации на CloudConvert")
+        
+        raise Exception("Превышено время ожидания конвертации")
+    
+    async def _convert_via_ezgif(self, file_bytes: bytes, from_format: str, 
+                                to_format: str, filename: str) -> bytes:
+        """Конвертация через EZGif (для GIF ↔ MP4)"""
+        
+        if from_format not in ['gif', 'mp4'] or to_format not in ['gif', 'mp4']:
+            raise Exception("EZGif поддерживает только GIF и MP4")
+        
+        # Определяем endpoint
+        if from_format == 'gif' and to_format == 'mp4':
+            endpoint = "https://ezgif.com/gif-to-mp4"
+        elif from_format == 'mp4' and to_format == 'gif':
+            endpoint = "https://ezgif.com/video-to-gif"
+        else:
+            raise Exception(f"EZGif не поддерживает {from_format}→{to_format}")
+        
+        # Загружаем файл
+        form_data = aiohttp.FormData()
+        form_data.add_field('new-image', 
+                          file_bytes,
+                          filename=f'{filename}.{from_format}',
+                          content_type=self._get_mime_type(from_format))
+        
+        async with self.session.post(endpoint, data=form_data) as resp:
+            if resp.status != 200:
+                raise Exception(f"Ошибка загрузки: {resp.status}")
+            
+            html = await resp.text()
+            
+            # Извлекаем hash из ответа
+            import re
+            match = re.search(r'name="file" value="([^"]+)"', html)
+            if not match:
+                raise Exception("Не удалось получить hash файла")
+            
+            file_hash = match.group(1)
+            
+            # Отправляем на конвертацию
+            convert_data = {
+                'file': file_hash,
+                'start': '0',
+                'end': '240',  # До 4 минут
+                'size': 'original',
+                'fps': '10',
+                'method': 'ffmpeg',
+                'convert': 'Convert!'
+            }
+            
+            async with self.session.post(endpoint, data=convert_data) as resp:
+                if resp.status != 200:
+                    raise Exception(f"Ошибка конвертации: {resp.status}")
+                
+                html = await resp.text()
+                
+                # Извлекаем URL для скачивания
+                match = re.search(r'href="([^"]+\.mp4)"', html)
+                if not match and to_format == 'gif':
+                    match = re.search(r'href="([^"]+\.gif)"', html)
+                
+                if match:
+                    download_path = match.group(1)
+                    if not download_path.startswith('http'):
+                        download_url = f"https:{download_path}"
+                    else:
+                        download_url = download_path
+                    
+                    async with self.session.get(download_url) as download_resp:
+                        if download_resp.status == 200:
+                            return await download_resp.read()
+        
+        raise Exception("Не удалось скачать конвертированный файл с EZGif")
+    
+    async def _convert_via_onlineconvertfree(self, file_bytes: bytes, from_format: str, 
+                                            to_format: str, filename: str) -> bytes:
+        """Конвертация через OnlineConvertFree"""
+        
+        # 1. Загружаем файл
+        upload_url = "https://onlineconvertfree.com/api/upload/"
+        
+        form_data = aiohttp.FormData()
+        form_data.add_field('file', 
+                          file_bytes,
+                          filename=f'{filename}.{from_format}',
+                          content_type=self._get_mime_type(from_format))
+        
+        async with self.session.post(upload_url, data=form_data) as resp:
+            if resp.status != 200:
+                raise Exception(f"Ошибка загрузки: {resp.status}")
+            
+            upload_result = await resp.json()
+            file_id = upload_result.get('file_id')
+            
+            if not file_id:
+                raise Exception("Не получен ID файла")
+        
+        # 2. Запускаем конвертацию
+        convert_url = f"https://onlineconvertfree.com/api/convert/{file_id}/{to_format}/"
+        
+        async with self.session.get(convert_url) as resp:
+            if resp.status != 200:
+                raise Exception(f"Ошибка запуска конвертации: {resp.status}")
+            
+            convert_result = await resp.json()
+            task_id = convert_result.get('task_id')
+            
+            if not task_id:
+                raise Exception("Не получен ID задачи")
+        
+        # 3. Ждем завершения
+        for _ in range(60):  # Максимум 60 попыток
+            await asyncio.sleep(3)
+            
+            status_url = f"https://onlineconvertfree.com/api/status/{task_id}/"
+            async with self.session.get(status_url) as resp:
+                if resp.status != 200:
+                    continue
+                
+                status_data = await resp.json()
+                status = status_data.get('status')
+                
+                if status == 'finished':
+                    download_url = status_data.get('download_url')
+                    if download_url:
+                        async with self.session.get(download_url) as download_resp:
+                            if download_resp.status == 200:
+                                return await download_resp.read()
+                    break
+                elif status == 'error':
+                    raise Exception("Ошибка конвертации")
+        
+        raise Exception("Превышено время ожидания конвертации")
+    
+    def _get_mime_type(self, file_format: str) -> str:
+        """Получение MIME-типа по расширению"""
+        mime_map = {
+            'mp4': 'video/mp4',
+            'gif': 'image/gif',
+            'mp3': 'audio/mpeg',
+            'wav': 'audio/wav',
+            'flac': 'audio/flac',
+            'avi': 'video/x-msvideo',
+            'mov': 'video/quicktime',
+            'webm': 'video/webm',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'png': 'image/png',
+            'webp': 'image/webp',
+        }
+        return mime_map.get(file_format.lower(), 'application/octet-stream')
+
+online_converter = OnlineConverter()
+
+# ==================== ФУНКЦИИ ОПРЕДЕЛЕНИЯ ТИПОВ ====================
+
+def detect_file_type(file_bytes: bytes, filename: str) -> str:
+    """Определение типа файла по содержимому и расширению"""
+    filename_lower = filename.lower()
+    
+    if filename_lower.endswith('.gif'):
+        return 'GIF'
+    elif filename_lower.endswith(('.mp4', '.mov', '.avi', '.mkv', '.webm')):
+        return 'video'
+    elif filename_lower.endswith(('.jpg', '.jpeg')):
+        return 'jpg'
+    elif filename_lower.endswith('.png'):
+        return 'png'
+    elif filename_lower.endswith('.webp'):
+        return 'webp'
+    elif filename_lower.endswith('.txt'):
+        return 'txt'
+    elif filename_lower.endswith('.pdf'):
+        return 'pdf'
+    
+    if len(file_bytes) >= 8:
+        if file_bytes[:6] in [b'GIF87a', b'GIF89a']:
+            return 'GIF'
+        elif file_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+            return 'png'
+        elif file_bytes[:2] == b'\xff\xd8':
+            return 'jpg'
+        elif len(file_bytes) >= 12 and file_bytes[:4] == b'RIFF' and file_bytes[8:12] == b'WEBP':
+            return 'webp'
+        elif file_bytes[:4] == b'%PDF':
+            return 'pdf'
+    
+    return 'unknown'
+
+# ==================== ФУНКЦИИ КОНВЕРТАЦИИ ====================
+
+async def convert_txt_to_pdf(txt_content: str) -> bytes:
+    """Конвертация TXT в PDF"""
+    try:
+        buffer = io.BytesIO()
+        c = canvas.Canvas(buffer, pagesize=A4)
+        width, height = A4
+        
+        c.setFont("Helvetica", 11)
+        margin = 50
+        y = height - margin
+        line_height = 14
+        
+        lines = txt_content.split('\n')
+        
+        for line in lines:
+            if y < margin:
+                c.showPage()
+                c.setFont("Helvetica", 11)
+                y = height - margin
+            
+            if len(line) > 80:
+                words = line.split()
+                current_line = ""
+                for word in words:
+                    test_line = current_line + " " + word if current_line else word
+                    if c.stringWidth(test_line, "Helvetica", 11) < width - 2 * margin:
+                        current_line = test_line
+                    else:
+                        c.drawString(margin, y, current_line)
+                        y -= line_height
+                        current_line = word
+                        if y < margin:
+                            c.showPage()
+                            c.setFont("Helvetica", 11)
+                            y = height - margin
+                if current_line:
+                    c.drawString(margin, y, current_line)
+                    y -= line_height
+            else:
+                c.drawString(margin, y, line)
+                y -= line_height
+        
+        c.save()
+        buffer.seek(0)
+        return buffer.getvalue()
+        
+    except Exception as e:
+        logger.error(f"Ошибка конвертации TXT в PDF: {e}")
+        raise Exception(f"Не удалось конвертировать TXT в PDF: {str(e)[:100]}")
+
+async def convert_pdf_to_txt(pdf_bytes: bytes) -> str:
+    """Конвертация PDF в TXT (информационное сообщение)"""
+    try:
+        return "📄 PDF файл получен.\n\nДля извлечения текста из PDF используйте специализированные программы:\n• Adobe Acrobat Reader\n• Онлайн-сервисы\n• Программы для OCR"
+    except Exception as e:
+        logger.error(f"Ошибка конвертации PDF в TXT: {e}")
+        raise Exception(f"Не удалось обработать PDF: {str(e)[:100]}")
+
+async def convert_image(file_bytes: bytes, source_format: str, target_format: str) -> bytes:
+    """Конвертация изображений"""
+    try:
+        loop = asyncio.get_event_loop()
+        
+        def _convert():
+            with Image.open(io.BytesIO(file_bytes)) as img:
+                if target_format in ['jpg', 'jpeg'] and img.mode in ['RGBA', 'LA', 'P']:
+                    background = Image.new('RGB', img.size, (255, 255, 255))
+                    if img.mode == 'RGBA':
+                        background.paste(img, mask=img.split()[3])
+                    else:
+                        background.paste(img)
+                    img = background
+                elif target_format == 'png' and img.mode in ['1', 'P']:
+                    img = img.convert('RGBA')
+                
+                output = io.BytesIO()
+                save_params = {'format': target_format.upper() if target_format != 'jpg' else 'JPEG'}
+                
+                if target_format in ['jpg', 'jpeg']:
+                    save_params['quality'] = 92
+                    save_params['optimize'] = True
+                elif target_format == 'png':
+                    save_params['optimize'] = True
+                    save_params['compress_level'] = 6
+                elif target_format == 'webp':
+                    save_params['quality'] = 85
+                    save_params['method'] = 6
+                elif target_format == 'GIF':
+                    save_params['save_all'] = True
+                    if hasattr(img, 'is_animated') and img.is_animated:
+                        save_params['duration'] = img.info.get('duration', 100)
+                
+                img.save(output, **save_params)
+                output.seek(0)
+                return output.getvalue()
+        
+        return await loop.run_in_executor(None, _convert)
+        
+    except Exception as e:
+        logger.error(f"Ошибка конвертации изображения {source_format}->{target_format}: {e}")
+        raise Exception(f"Не удалось конвертировать изображение: {str(e)[:100]}")
+
+async def convert_video_via_api(file_bytes: bytes, conv_type: str, original_name: str) -> Dict:
+    """Конвертация видео через онлайн API с увеличенным временем"""
+    
+    format_map = {
+        'GIF_to_mp4': ('gif', 'mp4'),
+        'mp4_to_GIF': ('mp4', 'gif'),
+        'video_to_mp3': ('mp4', 'mp3'),
+        'video_to_wav': ('mp4', 'wav'),
+        'video_to_flac': ('mp4', 'flac')
+    }
+    
+    if conv_type not in format_map:
+        raise Exception(f"Неподдерживаемый тип конвертации: {conv_type}")
+    
+    from_ext, to_ext = format_map[conv_type]
+    
+    try:
+        logger.info(f"Начинаю онлайн-конвертацию: {from_ext} -> {to_ext}")
+        
+        # Добавляем повторные попытки
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with online_converter as converter:
+                    converted_bytes = await converter.convert_file(
+                        file_bytes, 
+                        from_ext, 
+                        to_ext,
+                        original_name.split('.')[0]
+                    )
+                    
+                    if converted_bytes and len(converted_bytes) > 100:
+                        break
+                    
+            except Exception as e:
+                logger.warning(f"Попытка {attempt + 1}/{max_retries} не удалась: {e}")
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(2 * (attempt + 1))  # Увеличиваем задержку с каждой попыткой
+        
+        if '.' in original_name:
+            name_without_ext = original_name.rsplit('.', 1)[0]
+        else:
+            name_without_ext = original_name
+        
+        new_filename = f"{name_without_ext}_converted.{to_ext}"
+        
+        mime_types = {
+            'mp4': 'video/mp4',
+            'gif': 'image/gif',
+            'mp3': 'audio/mpeg',
+            'wav': 'audio/wav',
+            'flac': 'audio/flac'
+        }
+        
+        return {
+            'bytes': converted_bytes,
+            'filename': new_filename,
+            'mime_type': mime_types.get(to_ext, 'application/octet-stream')
+        }
+        
+    except asyncio.TimeoutError:
+        logger.error(f"Таймаут конвертации видео {conv_type}")
+        raise Exception("❌ Превышено время обработки видео. Попробуйте видео меньшего размера или длительности.")
+    except Exception as e:
+        logger.error(f"Ошибка онлайн-конвертации: {e}")
+        raise Exception(f"❌ Ошибка конвертации видео: {str(e)[:150]}")
+
+# ==================== ОСНОВНЫЕ ДАННЫЕ ====================
+
+user_data = {}
+processing_files = {}
+privacy_accepted = {}
+
+user_data_lock = asyncio.Lock()
+processing_files_lock = asyncio.Lock()
+
+# ==================== АДМИН КОМАНДЫ ====================
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Админ-панель"""
+    user_id = update.effective_user.id
+    
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет прав администратора.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 Общая статистика", callback_data='admin_stats')],
+        [InlineKeyboardButton("👥 Топ пользователей", callback_data='admin_top')],
+        [InlineKeyboardButton("🔨 Заблокировать", callback_data='admin_ban_menu')],
+        [InlineKeyboardButton("✅ Разблокировать", callback_data='admin_unban_menu')],
+        [InlineKeyboardButton("⛔ Список заблокированных", callback_data='admin_banned_list')],
+        [InlineKeyboardButton("📜 Последние логи", callback_data='admin_logs')],
+        [InlineKeyboardButton("🔍 Поиск пользователя", callback_data='admin_search')],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_to_menu')]
+    ]
+    
+    await update.message.reply_text(
+        "👑 Админ-панель\n\nВыберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_stats_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр общей статистики"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in ADMIN_IDS:
+        await query.edit_message_text("❌ Нет доступа")
+        return
+    
+    stats = db.get_total_stats()
+    recent = db.get_recent_conversions(5)
+    
+    total_conv = stats['successful_conversions'] + stats['failed_conversions']
+    success_rate = (stats['successful_conversions'] / total_conv * 100) if total_conv > 0 else 0
+    
+    message = f"""📊 Общая статистика бота
+
+👥 Пользователи:
+• Всего: {stats['total_users']}
+• Заблокировано: {stats['banned_users']}
+• Активных: {stats['total_users'] - stats['banned_users']}
+
+🔄 Конвертации:
+• Всего: {stats['total_conversions']}
+• За сегодня: {stats['today_conversions']}
+• Успешно: {stats['successful_conversions']}
+• Ошибок: {stats['failed_conversions']}
+• Успешность: {success_rate:.1f}%
+
+📁 Файлы:
+• Всего обработано: {stats['total_files']}
+• Среднее на пользователя: {stats['avg_conversions']}
+
+📋 Последние конвертации:
+"""
+    
+    for conv in recent:
+        status = "✅" if conv['success'] else "❌"
+        username = conv['username'] or f"ID: {conv['user_id']}"
+        conv_type = f"{conv['source']}→{conv['target']}" if conv['source'] and conv['target'] else conv['conversion_type']
+        timestamp = conv['timestamp'][:16] if isinstance(conv['timestamp'], str) else str(conv['timestamp'])[:16]
+        message += f"{status} {username} - {conv_type} [{timestamp}]\n"
+    
+    keyboard = [
+        [InlineKeyboardButton("👥 Топ пользователей", callback_data='admin_top')],
+        [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+    ]
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_top_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Топ пользователей"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    top_users = db.get_top_users(10)
+    
+    message = "👥 Топ пользователей по конвертациям\n\n"
+    
+    if top_users:
+        for i, user in enumerate(top_users, 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+            name = user['first_name'] or user['username'] or f"Пользователь {user['user_id']}"
+            message += f"{medal} {name}\n"
+            message += f"   • Конвертаций: {user['total_conversions']}\n"
+            message += f"   • Файлов: {user['total_files']}\n"
+            message += f"   • ID: {user['user_id']}\n\n"
+    else:
+        message += "Пока нет пользователей с конвертациями."
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 Общая статистика", callback_data='admin_stats')],
+        [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+    ]
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_ban_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню блокировки пользователя"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    await query.edit_message_text(
+        "🔨 Блокировка пользователя\n\n"
+        "Отправьте ID пользователя и причину в формате:\n"
+        "/ban 123456789 Причина блокировки\n\n"
+        "Пример: /ban 987654321 Спам",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+        ])
+    )
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /ban для блокировки"""
+    admin_id = update.effective_user.id
+    
+    if admin_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет прав администратора.")
+        return
+    
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "❌ Использование: /ban <user_id> [причина]"
+        )
+        return
+    
+    try:
+        target_id = int(args[0])
+        reason = ' '.join(args[1:]) if len(args) > 1 else "Нарушение правил"
+        
+        if target_id in ADMIN_IDS:
+            await update.message.reply_text("❌ Нельзя заблокировать администратора.")
+            return
+        
+        if db.is_banned(target_id):
+            await update.message.reply_text(f"❌ Пользователь {target_id} уже заблокирован.")
+            return
+        
+        db.ban_user(target_id, admin_id, reason)
+        db.log_action(admin_id, "ban_user", f"User {target_id}: {reason}")
+        
+        await update.message.reply_text(
+            f"✅ Пользователь заблокирован\n\n"
+            f"ID: {target_id}\n"
+            f"Причина: {reason}"
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Некорректный ID пользователя.")
+
+async def admin_unban_menu_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Меню разблокировки пользователя"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    await query.edit_message_text(
+        "✅ Разблокировка пользователя\n\n"
+        "Отправьте ID пользователя в формате:\n"
+        "/unban 123456789",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+        ])
+    )
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /unban для разблокировки"""
+    admin_id = update.effective_user.id
+    
+    if admin_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет прав администратора.")
+        return
+    
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "❌ Использование: /unban <user_id>"
+        )
+        return
+    
+    try:
+        target_id = int(args[0])
+        
+        if not db.is_banned(target_id):
+            await update.message.reply_text(f"❌ Пользователь {target_id} не заблокирован.")
+            return
+        
+        db.unban_user(target_id)
+        db.log_action(admin_id, "unban_user", f"User {target_id}")
+        
+        await update.message.reply_text(
+            f"✅ Пользователь разблокирован\n\nID: {target_id}"
+        )
+        
+    except ValueError:
+        await update.message.reply_text("❌ Некорректный ID пользователя.")
+
+async def admin_banned_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список заблокированных пользователей"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    banned_users = db.get_banned_users()
+    
+    message = "⛔ Заблокированные пользователи\n\n"
+    
+    if banned_users:
+        for user in banned_users[:10]:
+            name = user['first_name'] or user['username'] or f"ID: {user['user_id']}"
+            ban_date = user['banned_date'][:16] if isinstance(user['banned_date'], str) else str(user['banned_date'])[:16]
+            message += f"• {name}\n"
+            message += f"  ID: {user['user_id']}\n"
+            message += f"  Причина: {user['ban_reason'] or 'Не указана'}\n"
+            message += f"  Дата: {ban_date}\n\n"
+        
+        if len(banned_users) > 10:
+            message += f"и ещё {len(banned_users) - 10} пользователей"
+    else:
+        message += "Нет заблокированных пользователей."
+    
+    keyboard = [
+        [InlineKeyboardButton("🔨 Заблокировать", callback_data='admin_ban_menu')],
+        [InlineKeyboardButton("✅ Разблокировать", callback_data='admin_unban_menu')],
+        [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+    ]
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_logs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Просмотр последних логов"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    logs = db.get_all_logs(20)
+    
+    message = "📜 Последние действия пользователей\n\n"
+    
+    if logs:
+        for log in logs[:15]:
+            timestamp = log['timestamp'][:16] if isinstance(log['timestamp'], str) else str(log['timestamp'])[:16]
+            action_icon = {
+                'start': '🚀',
+                'start_conversion': '🔄',
+                'cancel': '❌',
+                'ban_user': '🔨',
+                'unban_user': '✅',
+                'accept_privacy': '📋',
+                'select_conversion': '🎯'
+            }.get(log['action'], '📌')
+            
+            message += f"{action_icon} {timestamp}\n"
+            message += f"  👤 {log['username']}\n"
+            message += f"  📋 {log['action']}"
+            if log['details']:
+                message += f": {log['details']}"
+            message += "\n\n"
+    else:
+        message += "Логов пока нет."
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Обновить", callback_data='admin_logs')],
+        [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+    ]
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def admin_search_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Поиск пользователя"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    await query.edit_message_text(
+        "🔍 Поиск пользователя\n\n"
+        "Отправьте ID пользователя в формате:\n"
+        "/searchuser 123456789\n\n"
+        "Или username: /searchuser @username",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+        ])
+    )
+
+async def searchuser_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /searchuser для поиска пользователя"""
+    admin_id = update.effective_user.id
+    
+    if admin_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ У вас нет прав администратора.")
+        return
+    
+    args = context.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "❌ Использование: /searchuser <user_id или @username>"
+        )
+        return
+    
+    search_term = args[0]
+    
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        
+        if search_term.startswith('@'):
+            username = search_term[1:]
+            cursor.execute('''
+                SELECT user_id, username, first_name, last_name, joined_date, last_activity,
+                       total_conversions, total_files, is_banned, ban_reason
+                FROM users WHERE username = ?
+            ''', (username,))
+        else:
+            try:
+                user_id = int(search_term)
+                cursor.execute('''
+                    SELECT user_id, username, first_name, last_name, joined_date, last_activity,
+                           total_conversions, total_files, is_banned, ban_reason
+                    FROM users WHERE user_id = ?
+                ''', (user_id,))
+            except ValueError:
+                await update.message.reply_text("❌ Некорректный ID пользователя.")
+                return
+        
+        row = cursor.fetchone()
+        
+        if row:
+            cursor.execute('''
+                SELECT conversion_type, success, timestamp
+                FROM conversions
+                WHERE user_id = ?
+                ORDER BY timestamp DESC LIMIT 5
+            ''', (row[0],))
+            conversions = cursor.fetchall()
+            
+            message = f"""👤 Информация о пользователе
+
+ID: {row[0]}
+Username: @{row[1] if row[1] else 'не указан'}
+Имя: {row[2] or 'не указано'}
+Фамилия: {row[3] or 'не указана'}
+Регистрация: {row[4][:16] if row[4] else 'неизвестно'}
+Последняя активность: {row[5][:16] if row[5] else 'неизвестно'}
+Конвертаций: {row[6]}
+Файлов: {row[7]}
+Статус: {'⛔ ЗАБЛОКИРОВАН' if row[8] else '✅ Активен'}
+"""
+            
+            if row[8] and row[9]:
+                message += f"Причина бана: {row[9]}\n"
+            
+            if conversions:
+                message += "\nПоследние конвертации:\n"
+                for conv in conversions:
+                    status = "✅" if conv[1] else "❌"
+                    message += f"{status} {conv[0]} [{conv[2][:16]}]\n"
+            
+            keyboard = []
+            if not row[8]:
+                keyboard.append([InlineKeyboardButton("🔨 Заблокировать", callback_data=f'admin_ban_{row[0]}')])
+            else:
+                keyboard.append([InlineKeyboardButton("✅ Разблокировать", callback_data=f'admin_unban_{row[0]}')])
+            keyboard.append([InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')])
+            
+            await update.message.reply_text(
+                message,
+                reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+            )
+        else:
+            await update.message.reply_text("❌ Пользователь не найден.")
+
+async def admin_panel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Возврат в админ-панель из callback"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 Общая статистика", callback_data='admin_stats')],
+        [InlineKeyboardButton("👥 Топ пользователей", callback_data='admin_top')],
+        [InlineKeyboardButton("🔨 Заблокировать", callback_data='admin_ban_menu')],
+        [InlineKeyboardButton("✅ Разблокировать", callback_data='admin_unban_menu')],
+        [InlineKeyboardButton("⛔ Список заблокированных", callback_data='admin_banned_list')],
+        [InlineKeyboardButton("📜 Последние логи", callback_data='admin_logs')],
+        [InlineKeyboardButton("🔍 Поиск пользователя", callback_data='admin_search')],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_to_menu')]
+    ]
+    
+    await query.edit_message_text(
+        "👑 Админ-панель\n\nВыберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ==================== ОБРАБОТЧИКИ КОМАНД ====================
+
+@check_ban
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+    first_name = update.effective_user.first_name
+    last_name = update.effective_user.last_name
+    
+    db.add_user(user_id, username, first_name, last_name)
+    db.log_action(user_id, "start", "Запустил бота")
+    
+    if user_id not in privacy_accepted:
+        keyboard = [[InlineKeyboardButton("✅ Я согласен", callback_data='accept_privacy')]]
+        await update.message.reply_text(
+            "📋 Политика конфиденциальности\n\n"
+            "Используя этого бота, вы соглашаетесь с:\n"
+            "• Файлы хранятся только во время конвертации\n"
+            "• Содержимое не анализируется\n"
+            "• Данные не передаются третьим лицам\n\n"
+            "Нажмите кнопку для продолжения:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+        [InlineKeyboardButton("📄 Документы (TXT↔PDF)", callback_data='category_documents')],
+        [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')],
+        [InlineKeyboardButton("👤 Мой профиль", callback_data='profile')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("👑 Админ-панель", callback_data='admin_panel')])
+    
+    await update.message.reply_text(
+        "🔄 Конвертер файлов\n\n"
+        "Привет! Я помогу конвертировать файлы в разные форматы.\n\n"
+        "📌 Доступные форматы:\n"
+        "• Изображения: JPG, PNG, WebP, GIF\n"
+        "• Документы: TXT ↔ PDF\n"
+        "• Видео/Аудио: GIF↔MP4, Видео→MP3/WAV/FLAC\n\n"
+        "⚠️ Видео → GIF: до 4 минут\n\n"
+        "Выберите категорию:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+@check_ban
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    keyboard = [
+        [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+        [InlineKeyboardButton("📄 Документы", callback_data='category_documents')],
+        [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')],
+        [InlineKeyboardButton("👤 Мой профиль", callback_data='profile')],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_to_menu')]
+    ]
+    
+    message = """📋 Подробная справка
+
+📸 Изображения:
+• JPG/JPEG ↔ PNG ↔ WebP ↔ GIF
+• Максимальный размер: 20 МБ
+• До 5 файлов за раз
+• Для GIF используется первый кадр
+
+📄 Документы:
+• TXT → PDF (текст в PDF документ)
+• PDF → TXT (информация о PDF)
+• Максимальный размер: 10 МБ
+• До 3 файлов за раз
+
+🎬 Видео/Аудио:
+• GIF → MP4 (анимация в видео)
+• Видео → GIF (видео в анимацию, до 4 минут)
+• Видео → MP3/WAV/FLAC (извлечение аудио)
+• Максимальный размер: 50 МБ
+• 1 файл за раз
+• Онлайн-конвертация
+
+👤 Профиль:
+• /profile - статистика использования
+
+🔄 Команды:
+/start - Главное меню
+/help - Помощь
+/convert - Начать конвертацию
+/profile - Моя статистика
+/cancel - Отмена"""
+    
+    await update.message.reply_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+@check_ban
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /profile - статистика пользователя"""
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    stats = db.get_user_stats(user_id)
+    user_info = db.get_user(user_id)
+    
+    if not stats:
+        await update.message.reply_text("❌ Статистика не найдена.")
+        return
+    
+    joined = stats.get('joined_date', 'Неизвестно')
+    if isinstance(joined, str):
+        joined = joined[:16] if len(joined) > 16 else joined
+    elif isinstance(joined, datetime):
+        joined = joined.strftime('%Y-%m-%d %H:%M')
+    
+    last_active = stats.get('last_activity', 'Неизвестно')
+    if isinstance(last_active, str):
+        last_active = last_active[:16] if len(last_active) > 16 else last_active
+    elif isinstance(last_active, datetime):
+        last_active = last_active.strftime('%Y-%m-%d %H:%M')
+    
+    status = "⛔ Заблокирован" if user_info and user_info['is_banned'] else "✅ Активен"
+    
+    message = f"""👤 Ваш профиль
+
+🆔 ID: {user_id}
+📊 Статус: {status}
+🔄 Конвертаций: {stats.get('total_conversions', 0)}
+📁 Файлов обработано: {stats.get('total_files', 0)}
+📅 Зарегистрирован: {joined}
+🕐 Последняя активность: {last_active}
+"""
+    
+    if user_info and user_info['is_banned'] and user_info['ban_reason']:
+        message += f"\n⛔ Причина бана: {user_info['ban_reason']}"
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Новая конвертация", callback_data='back_to_menu')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    
+    await update.message.reply_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+@check_ban
+async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /convert - начало конвертации"""
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    async with user_data_lock:
+        if user_id not in user_data:
+            await update.message.reply_text(
+                "❌ Сначала выберите тип конвертации через меню и отправьте файлы.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+                    [InlineKeyboardButton("📄 Документы", callback_data='category_documents')],
+                    [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')]
+                ])
+            )
+            return
+        
+        user_info = user_data[user_id]
+    
+    if len(user_info['files']) == 0:
+        await update.message.reply_text("❌ Сначала отправьте файлы для конвертации.")
+        return
+    
+    db.log_action(user_id, "start_conversion", f"{user_info['source']}->{user_info['target']}")
+    await start_conversion(update, user_info, user_id)
+
+@check_ban
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /cancel - отмена операции"""
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    async with user_data_lock:
+        if user_id in user_data:
+            del user_data[user_id]
+    
+    async with processing_files_lock:
+        if user_id in processing_files:
+            del processing_files[user_id]
+    
+    db.log_action(user_id, "cancel", "Отменил операцию")
+    await update.message.reply_text("❌ Операция отменена. Выберите новое действие в меню.")
+
+# ==================== ОБРАБОТЧИК КНОПОК ====================
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатий на кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    if db.is_banned(user_id):
+        await query.edit_message_text(
+            "⛔ Доступ заблокирован\n\n"
+            "Ваш аккаунт был заблокирован администратором."
+        )
+        return
+    
+    # ===== АДМИН КНОПКИ =====
+    if user_id in ADMIN_IDS:
+        if query.data == 'admin_panel':
+            await admin_panel_callback(update, context)
+            return
+        elif query.data == 'admin_stats':
+            await admin_stats_handler(update, context)
+            return
+        elif query.data == 'admin_top':
+            await admin_top_handler(update, context)
+            return
+        elif query.data == 'admin_ban_menu':
+            await admin_ban_menu_handler(update, context)
+            return
+        elif query.data == 'admin_unban_menu':
+            await admin_unban_menu_handler(update, context)
+            return
+        elif query.data == 'admin_banned_list':
+            await admin_banned_list_handler(update, context)
+            return
+        elif query.data == 'admin_logs':
+            await admin_logs_handler(update, context)
+            return
+        elif query.data == 'admin_search':
+            await admin_search_handler(update, context)
+            return
+        
+        if query.data.startswith('admin_ban_'):
+            target_id = int(query.data.split('_')[2])
+            await quick_ban_user(query, user_id, target_id)
+            return
+        elif query.data.startswith('admin_unban_'):
+            target_id = int(query.data.split('_')[2])
+            await quick_unban_user(query, user_id, target_id)
+            return
+    
+    # ===== ОБЩИЕ КНОПКИ =====
+    if query.data == 'accept_privacy':
+        privacy_accepted[user_id] = True
+        db.log_action(user_id, "accept_privacy", "Принял политику")
+        await start_from_query(query, user_id)
+    
+    elif query.data == 'help':
+        await help_command_from_query(query)
+    
+    elif query.data == 'profile':
+        await profile_from_query(query, user_id)
+    
+    elif query.data == 'back_to_menu':
+        await show_main_menu_from_query(query, user_id)
+    
+    elif query.data == 'back_to_category':
+        await back_to_category(query, user_id)
+    
+    # ===== КАТЕГОРИИ =====
+    elif query.data == 'category_images':
+        await show_image_categories(query)
+    
+    elif query.data == 'category_documents':
+        await show_document_formats(query)
+    
+    elif query.data == 'category_video':
+        await show_video_categories(query)
+    
+    # ===== ВИДЕО/АУДИО =====
+    elif query.data == 'video_conversion':
+        await show_video_conversion_formats(query)
+    
+    elif query.data == 'audio_extraction':
+        await show_audio_extraction_formats(query)
+    
+    # ===== ИЗОБРАЖЕНИЯ =====
+    elif query.data == 'jpg_category':
+        await show_jpg_formats(query)
+    elif query.data == 'png_category':
+        await show_png_formats(query)
+    elif query.data == 'webp_category':
+        await show_webp_formats(query)
+    elif query.data == 'GIF_category':
+        await show_GIF_formats(query)
+    
+    # ===== ДОКУМЕНТЫ =====
+    elif query.data == 'doc_category':
+        await show_document_conversion_formats(query)
+    
+    # ===== КОНВЕРТАЦИЯ =====
+    elif query.data == 'start_conversion':
+        await start_conversion_from_button(query, user_id)
+    
+    # ===== ФОРМАТЫ КОНВЕРТАЦИИ =====
+    else:
+        conversion_map = {
+            # Изображения
+            'jpg_to_png': ('jpg', 'png', 20, '🖼️', 5, 'JPG → PNG'),
+            'jpg_to_webp': ('jpg', 'webp', 20, '🖼️', 5, 'JPG → WebP'),
+            'jpg_to_GIF': ('jpg', 'GIF', 20, '🖼️', 5, 'JPG → GIF'),
+            'png_to_jpg': ('png', 'jpg', 20, '🖼️', 5, 'PNG → JPG'),
+            'png_to_webp': ('png', 'webp', 20, '🖼️', 5, 'PNG → WebP'),
+            'png_to_GIF': ('png', 'GIF', 20, '🖼️', 5, 'PNG → GIF'),
+            'webp_to_jpg': ('webp', 'jpg', 20, '🖼️', 5, 'WebP → JPG'),
+            'webp_to_png': ('webp', 'png', 20, '🖼️', 5, 'WebP → PNG'),
+            'webp_to_GIF': ('webp', 'GIF', 20, '🖼️', 5, 'WebP → GIF'),
+            'GIF_to_jpg': ('GIF', 'jpg', 20, '🖼️', 5, 'GIF → JPG'),
+            'GIF_to_png': ('GIF', 'png', 20, '🖼️', 5, 'GIF → PNG'),
+            'GIF_to_webp': ('GIF', 'webp', 20, '🖼️', 5, 'GIF → WebP'),
+            
+            # Документы
+            'txt_to_pdf': ('txt', 'pdf', 10, '📄', 3, 'TXT → PDF'),
+            'pdf_to_txt': ('pdf', 'txt', 10, '📝', 3, 'PDF → TXT'),
+            
+            # Видео/Аудио
+            'GIF_to_mp4': ('GIF', 'mp4', 50, '🎬', 1, 'GIF → MP4'),
+            'mp4_to_GIF': ('video', 'GIF', 50, '🎬', 1, 'MP4 → GIF (до 4 мин)'),
+            'video_to_mp3': ('video', 'mp3', 50, '🎵', 1, 'Видео → MP3'),
+            'video_to_wav': ('video', 'wav', 50, '🎵', 1, 'Видео → WAV'),
+            'video_to_flac': ('video', 'flac', 50, '🎵', 1, 'Видео → FLAC'),
+        }
+        
+        if query.data in conversion_map:
+            await setup_conversion(query, user_id, query.data, conversion_map)
+
+async def quick_ban_user(query, admin_id: int, target_id: int):
+    """Быстрая блокировка пользователя"""
+    if target_id in ADMIN_IDS:
+        await query.edit_message_text("❌ Нельзя заблокировать администратора.")
+        return
+    
+    if db.is_banned(target_id):
+        await query.edit_message_text(f"❌ Пользователь {target_id} уже заблокирован.")
+        return
+    
+    db.ban_user(target_id, admin_id, "Быстрая блокировка из админ-панели")
+    db.log_action(admin_id, "ban_user", f"User {target_id}: Быстрая блокировка")
+    
+    await query.edit_message_text(
+        f"✅ Пользователь заблокирован\n\nID: {target_id}\nПричина: Быстрая блокировка",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+        ])
+    )
+
+async def quick_unban_user(query, admin_id: int, target_id: int):
+    """Быстрая разблокировка пользователя"""
+    if not db.is_banned(target_id):
+        await query.edit_message_text(f"❌ Пользователь {target_id} не заблокирован.")
+        return
+    
+    db.unban_user(target_id)
+    db.log_action(admin_id, "unban_user", f"User {target_id}: Быстрая разблокировка")
+    
+    await query.edit_message_text(
+        f"✅ Пользователь разблокирован\n\nID: {target_id}",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Назад в админку", callback_data='admin_panel')]
+        ])
+    )
+
+async def start_from_query(query, user_id: int):
+    """Стартовое меню после принятия политики"""
+    keyboard = [
+        [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+        [InlineKeyboardButton("📄 Документы (TXT↔PDF)", callback_data='category_documents')],
+        [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')],
+        [InlineKeyboardButton("👤 Мой профиль", callback_data='profile')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("👑 Админ-панель", callback_data='admin_panel')])
+    
+    await query.edit_message_text(
+        "🔄 Конвертер файлов\n\nВыберите категорию для конвертации:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def help_command_from_query(query):
+    """Помощь из callback"""
+    keyboard = [
+        [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+        [InlineKeyboardButton("📄 Документы", callback_data='category_documents')],
+        [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_to_menu')]
+    ]
+    
+    message = """📋 Доступные категории:
+
+📸 Изображения:
+• JPG/JPEG ↔ PNG ↔ WebP ↔ GIF
+• Максимум: 20 МБ, до 5 файлов
+• Для GIF используется первый кадр
+
+📄 Документы:
+• TXT → PDF
+• PDF → TXT (информация)
+• Максимум: 10 МБ, до 3 файлов
+
+🎬 Видео/Аудио:
+• GIF ↔ MP4
+• Видео → GIF (до 4 минут)
+• Видео → MP3/WAV/FLAC
+• Максимум: 50 МБ, 1 файл
+• Онлайн-конвертация"""
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def profile_from_query(query, user_id: int):
+    """Профиль из callback"""
+    stats = db.get_user_stats(user_id)
+    user_info = db.get_user(user_id)
+    
+    joined = stats.get('joined_date', 'Неизвестно')
+    if isinstance(joined, str):
+        joined = joined[:16] if len(joined) > 16 else joined
+    
+    last_active = stats.get('last_activity', 'Неизвестно')
+    if isinstance(last_active, str):
+        last_active = last_active[:16] if len(last_active) > 16 else last_active
+    
+    status = "⛔ Заблокирован" if user_info and user_info['is_banned'] else "✅ Активен"
+    
+    message = f"""👤 Ваш профиль
+
+🆔 ID: {user_id}
+📊 Статус: {status}
+🔄 Конвертаций: {stats.get('total_conversions', 0)}
+📁 Файлов обработано: {stats.get('total_files', 0)}
+📅 Зарегистрирован: {joined}
+🕐 Последняя активность: {last_active}
+"""
+    
+    keyboard = [
+        [InlineKeyboardButton("🔄 Новая конвертация", callback_data='back_to_menu')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_main_menu_from_query(query, user_id: int):
+    """Главное меню из callback"""
+    keyboard = [
+        [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+        [InlineKeyboardButton("📄 Документы (TXT↔PDF)", callback_data='category_documents')],
+        [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')],
+        [InlineKeyboardButton("👤 Мой профиль", callback_data='profile')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("👑 Админ-панель", callback_data='admin_panel')])
+    
+    await query.edit_message_text(
+        "🔄 Конвертер файлов\n\nВыберите категорию для конвертации:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def back_to_category(query, user_id: int):
+    """Возврат к категории"""
+    async with user_data_lock:
+        if user_id in user_data:
+            conv_type = user_data[user_id].get('type', '')
+            
+            if 'jpg' in conv_type or 'png' in conv_type or 'webp' in conv_type or 'GIF' in conv_type:
+                await show_image_categories(query)
+            elif 'txt' in conv_type or 'pdf' in conv_type:
+                await show_document_formats(query)
+            elif 'video' in conv_type or 'mp4' in conv_type or 'GIF_to_mp4' in conv_type:
+                await show_video_categories(query)
+            else:
+                await show_main_menu_from_query(query, user_id)
+        else:
+            await show_main_menu_from_query(query, user_id)
+
+# ==================== МЕНЮ КАТЕГОРИЙ ====================
+
+async def show_image_categories(query):
+    """Меню изображений"""
+    keyboard = [
+        [InlineKeyboardButton("🖼️ JPG/JPEG файлы", callback_data='jpg_category')],
+        [InlineKeyboardButton("🖼️ PNG файлы", callback_data='png_category')],
+        [InlineKeyboardButton("🖼️ WebP файлы", callback_data='webp_category')],
+        [InlineKeyboardButton("🖼️ GIF файлы", callback_data='GIF_category')],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_to_menu')]
+    ]
+    await query.edit_message_text(
+        "📸 Категория: Изображения\n\n"
+        "Выберите исходный формат:\n"
+        "• JPG/JPEG\n"
+        "• PNG\n"
+        "• WebP\n"
+        "• GIF\n\n"
+        "📏 Максимальный размер: 20 МБ\n"
+        "📦 До 5 файлов за раз\n\n"
+        "⚠️ Для GIF используется только первый кадр",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_document_formats(query):
+    """Меню документов"""
+    keyboard = [
+        [InlineKeyboardButton("📄 Конвертация документов", callback_data='doc_category')],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_to_menu')]
+    ]
+    await query.edit_message_text(
+        "📄 Категория: Документы\n\n"
+        "Доступные конвертации:\n\n"
+        "📝 TXT → PDF\n"
+        "• Текстовый файл в PDF документ\n"
+        "• Сохраняется форматирование\n\n"
+        "📄 PDF → TXT\n"
+        "• Информация о PDF файле\n\n"
+        "📏 Максимальный размер: 10 МБ\n"
+        "📦 До 3 файлов за раз",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_document_conversion_formats(query):
+    """Меню конвертации документов"""
+    keyboard = [
+        [InlineKeyboardButton("📝 TXT → PDF", callback_data='txt_to_pdf')],
+        [InlineKeyboardButton("📄 PDF → TXT", callback_data='pdf_to_txt')],
+        [InlineKeyboardButton("⬅️ Назад к документам", callback_data='category_documents')]
+    ]
+    await query.edit_message_text(
+        "📄 Конвертация документов\n\n"
+        "Выберите направление конвертации:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_video_categories(query):
+    """Меню видео/аудио"""
+    keyboard = [
+        [InlineKeyboardButton("🎬 Конвертация видео (GIF↔MP4)", callback_data='video_conversion')],
+        [InlineKeyboardButton("🎵 Извлечение аудио (Видео→MP3/WAV/FLAC)", callback_data='audio_extraction')],
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data='back_to_menu')]
+    ]
+    
+    message = """🎬 Категория: Видео/Аудио
+
+Доступные операции:
+
+🎬 Конвертация видео:
+• GIF → MP4
+• Видео → GIF (до 4 минут)
+
+🎵 Извлечение аудио:
+• Видео → MP3 (сжатие)
+• Видео → WAV (без сжатия)
+• Видео → FLAC (без потерь)
+
+⚠️ Онлайн-конвертация:
+• Максимальный размер: 50 МБ
+• Только 1 файл за раз
+• Может занять до 3 минут"""
+    
+    await query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_video_conversion_formats(query):
+    """Меню конвертации видео"""
+    keyboard = [
+        [InlineKeyboardButton("🎬 GIF → MP4", callback_data='GIF_to_mp4')],
+        [InlineKeyboardButton("🎬 Видео → GIF (до 4 мин)", callback_data='mp4_to_GIF')],
+        [InlineKeyboardButton("⬅️ Назад к видео", callback_data='category_video')]
+    ]
+    await query.edit_message_text(
+        "🎬 Конвертация видео\n\n"
+        "GIF → MP4\n"
+        "• Анимация в видео\n"
+        "• Меньший размер файла\n\n"
+        "Видео → GIF\n"
+        "• Видео в анимацию\n"
+        "• Макс. длительность: 4 минуты (240 сек)\n\n"
+        "⚠️ Используется онлайн-сервис",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_audio_extraction_formats(query):
+    """Меню извлечения аудио"""
+    keyboard = [
+        [InlineKeyboardButton("🎵 MP3 (сжатие)", callback_data='video_to_mp3')],
+        [InlineKeyboardButton("🎵 WAV (без сжатия)", callback_data='video_to_wav')],
+        [InlineKeyboardButton("🎵 FLAC (без потерь)", callback_data='video_to_flac')],
+        [InlineKeyboardButton("⬅️ Назад к видео", callback_data='category_video')]
+    ]
+    await query.edit_message_text(
+        "🎵 Извлечение аудио из видео\n\n"
+        "MP3 - хорошее сжатие, универсальный\n"
+        "WAV - без сжатия, высокое качество\n"
+        "FLAC - сжатие без потерь\n\n"
+        "⚠️ Используется онлайн-конвертация",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_jpg_formats(query):
+    """Меню JPG форматов"""
+    keyboard = [
+        [InlineKeyboardButton("🖼️ JPG → PNG", callback_data='jpg_to_png')],
+        [InlineKeyboardButton("🖼️ JPG → WebP", callback_data='jpg_to_webp')],
+        [InlineKeyboardButton("🖼️ JPG → GIF", callback_data='jpg_to_GIF')],
+        [InlineKeyboardButton("⬅️ Назад к изображениям", callback_data='category_images')]
+    ]
+    await query.edit_message_text(
+        "🖼️ Исходный формат: JPG/JPEG\n\n"
+        "Выберите целевой формат:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_png_formats(query):
+    """Меню PNG форматов"""
+    keyboard = [
+        [InlineKeyboardButton("🖼️ PNG → JPG", callback_data='png_to_jpg')],
+        [InlineKeyboardButton("🖼️ PNG → WebP", callback_data='png_to_webp')],
+        [InlineKeyboardButton("🖼️ PNG → GIF", callback_data='png_to_GIF')],
+        [InlineKeyboardButton("⬅️ Назад к изображениям", callback_data='category_images')]
+    ]
+    await query.edit_message_text(
+        "🖼️ Исходный формат: PNG\n\n"
+        "Выберите целевой формат:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_webp_formats(query):
+    """Меню WebP форматов"""
+    keyboard = [
+        [InlineKeyboardButton("🖼️ WebP → JPG", callback_data='webp_to_jpg')],
+        [InlineKeyboardButton("🖼️ WebP → PNG", callback_data='webp_to_png')],
+        [InlineKeyboardButton("🖼️ WebP → GIF", callback_data='webp_to_GIF')],
+        [InlineKeyboardButton("⬅️ Назад к изображениям", callback_data='category_images')]
+    ]
+    await query.edit_message_text(
+        "🖼️ Исходный формат: WebP\n\n"
+        "Выберите целевой формат:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def show_GIF_formats(query):
+    """Меню GIF форматов"""
+    keyboard = [
+        [InlineKeyboardButton("🖼️ GIF → JPG", callback_data='GIF_to_jpg')],
+        [InlineKeyboardButton("🖼️ GIF → PNG", callback_data='GIF_to_png')],
+        [InlineKeyboardButton("🖼️ GIF → WebP", callback_data='GIF_to_webp')],
+        [InlineKeyboardButton("⬅️ Назад к изображениям", callback_data='category_images')]
+    ]
+    await query.edit_message_text(
+        "🖼️ Исходный формат: GIF\n\n"
+        "⚠️ Используется только первый кадр\n\n"
+        "Выберите целевой формат:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def setup_conversion(query, user_id: int, callback_data: str, conversion_map: Dict):
+    """Настройка конвертации"""
+    source, target, max_mb, emoji, max_files, display_name = conversion_map[callback_data]
+    
+    if callback_data in ['GIF_to_mp4', 'mp4_to_GIF', 'video_to_mp3', 'video_to_wav', 'video_to_flac']:
+        max_mb = 50  # Увеличиваем до 50 МБ для видео
+        max_files = 1
+    
+    async with user_data_lock:
+        user_data[user_id] = {
+            'type': callback_data,
+            'source': source,
+            'target': target,
+            'max_size': max_mb * 1024 * 1024,
+            'max_files': max_files,
+            'files': [],
+            'status_message': None
+        }
+    
+    format_names = {
+        'jpg': 'JPG изображение',
+        'png': 'PNG изображение',
+        'webp': 'WebP изображение',
+        'GIF': 'GIF анимация',
+        'txt': 'текстовый файл',
+        'pdf': 'PDF документ',
+        'mp4': 'MP4 видео',
+        'video': 'видео файл',
+        'mp3': 'MP3 аудио',
+        'wav': 'WAV аудио',
+        'flac': 'FLAC аудио'
+    }
+    
+    files_text = f"Максимум файлов: {max_files}" if max_files > 1 else "Только 1 файл"
+    warning_text = ""
+    api_warning = ""
+    
+    if callback_data in ['GIF_to_jpg', 'GIF_to_png', 'GIF_to_webp']:
+        warning_text = "\n⚠️ Используется только первый кадр GIF"
+    elif callback_data in ['GIF_to_mp4', 'mp4_to_GIF', 'video_to_mp3', 'video_to_wav', 'video_to_flac']:
+        api_warning = "\n🌐 Онлайн-конвертация\n• Максимум: 50 МБ\n• Видео → GIF: до 4 минут\n• Может занять до 3 минут"
+    
+    await query.edit_message_text(
+        f"{emoji} {display_name}\n\n"
+        f"📤 Отправьте файл(ы) .{source}\n"
+        f"📏 Максимальный размер: {max_mb} МБ\n"
+        f"📦 {files_text}\n\n"
+        f"📋 Тип: {format_names.get(source, source)}\n"
+        f"✅ Результат: {format_names.get(target, target)}"
+        f"{warning_text}{api_warning}\n\n"
+        f"💡 Инструкция:\n"
+        f"1. Отправьте файлы\n"
+        f"2. Когда готовы, отправьте /convert\n"
+        f"3. Или нажмите '🚀 Начать конвертацию'\n\n"
+        f"❌ Отмена: /cancel",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🚀 Начать конвертацию", callback_data='start_conversion')],
+            [InlineKeyboardButton("⬅️ Назад", callback_data='back_to_category')]
+        ])
+    )
+    
+    db.log_action(user_id, "select_conversion", f"{source}->{target}")
+
+async def start_conversion_from_button(query, user_id: int):
+    """Начать конвертацию из кнопки"""
+    async with user_data_lock:
+        if user_id not in user_data:
+            await query.answer("❌ Сначала отправьте файлы!", show_alert=True)
+            return
+        
+        if len(user_data[user_id]['files']) == 0:
+            await query.answer("❌ Сначала отправьте файлы!", show_alert=True)
+            return
+    
+    await query.edit_message_text("🚀 Начинаю конвертацию...")
+    await start_conversion_from_query(query, user_id)
+
+async def start_conversion_from_query(query, user_id: int):
+    """Запуск конвертации из query"""
+    async with user_data_lock:
+        user_info = user_data[user_id]
+    
+    await process_conversion(user_info, user_id, query.message.chat_id, query.message.message_id)
+
+async def start_conversion(update: Update, user_info: Dict, user_id: int):
+    """Запуск конвертации из команды"""
+    await process_conversion(user_info, user_id, update.message.chat_id, update.message.message_id)
+
+# ==================== ПРОЦЕСС КОНВЕРТАЦИИ ====================
+
+async def update_progress(user_id: int, current: int, total: int, progress: int, status_msg=None):
+    """Обновление прогресса конвертации"""
+    async with processing_files_lock:
+        if user_id in processing_files:
+            processing_files[user_id]['progress'] = progress
+            processing_files[user_id]['current_file'] = current
+            processing_files[user_id]['total_files'] = total
+    
+    if status_msg:
+        progress_bar = "🟩" * int(progress / 10) + "⬜" * (10 - int(progress / 10))
+        try:
+            await status_msg.edit_text(
+                f"🔄 Обработка файла {current}/{total}\n\n"
+                f"{progress_bar} {progress}%\n\n"
+                f"⏳ Пожалуйста, подождите..."
+            )
+        except:
+            pass
+
+async def show_progress_bar(message, current: int, total: int, text: str = ""):
+    """Показ прогресс-бара"""
+    try:
+        progress = int((current / total) * 100) if total > 0 else 0
+        progress_bar = "🟩" * int(progress / 10) + "⬜" * (10 - int(progress / 10))
+        await message.edit_text(
+            f"🔄 {text}\n\n{progress_bar} {progress}%\n\n📊 Прогресс: {current}/{total}"
+        )
+    except:
+        pass
+
+async def process_conversion(user_info: Dict, user_id: int, chat_id: int, message_id: int):
+    """Основной процесс конвертации"""
+    total_files = len(user_info['files'])
+    start_time = time.time()
+    
+    if total_files == 0:
+        return
+    
+    status_msg = await application.bot.send_message(
+        chat_id=chat_id,
+        text="🔄 Начинаю обработку файлов..."
+    )
+    
+    async with processing_files_lock:
+        processing_files[user_id] = {
+            'progress': 0,
+            'current_file': 1,
+            'total_files': total_files
+        }
+    
+    try:
+        converted_files = []
+        success_count = 0
+        
+        for idx, file_info in enumerate(user_info['files'], 1):
+            try:
+                await show_progress_bar(status_msg, idx-1, total_files, "Загрузка файлов...")
+                
+                file = await application.bot.get_file(file_info['file_id'])
+                file_bytes = await file.download_as_bytearray()
+                
+                if len(file_bytes) > user_info['max_size']:
+                    max_mb = user_info['max_size'] // (1024 * 1024)
+                    raise Exception(f"Файл слишком большой. Максимум: {max_mb} МБ")
+                
+                await show_progress_bar(status_msg, idx-1, total_files, "Конвертация файла...")
+                
+                source_ext = user_info['source']
+                target_ext = user_info['target']
+                conv_type = user_info['type']
+                original_name = file_info['file_name']
+                
+                detected_type = detect_file_type(bytes(file_bytes), original_name)
+                logger.info(f"Файл {original_name}: ожидаемый {source_ext}, определен {detected_type}")
+                
+                # ===== КОНВЕРТАЦИЯ ИЗОБРАЖЕНИЙ =====
+                if source_ext in ['jpg', 'jpeg', 'png', 'webp', 'GIF']:
+                    if source_ext == 'GIF' and detected_type != 'GIF':
+                        raise Exception(f"Файл {original_name} не является GIF.")
+                    elif source_ext in ['jpg', 'jpeg'] and detected_type not in ['jpg', 'jpeg']:
+                        raise Exception(f"Файл {original_name} не является JPG/JPEG.")
+                    elif source_ext == 'png' and detected_type != 'png':
+                        raise Exception(f"Файл {original_name} не является PNG.")
+                    elif source_ext == 'webp' and detected_type != 'webp':
+                        raise Exception(f"Файл {original_name} не является WebP.")
+                    
+                    converted_bytes = await convert_image(bytes(file_bytes), source_ext, target_ext)
+                    
+                    name_without_ext = original_name.rsplit('.', 1)[0] if '.' in original_name else original_name
+                    new_filename = f"{name_without_ext}_converted.{target_ext}"
+                    
+                    mime_types = {
+                        'jpg': 'image/jpeg',
+                        'png': 'image/png',
+                        'webp': 'image/webp',
+                        'GIF': 'image/gif'
+                    }
+                    
+                    converted_files.append({
+                        'bytes': converted_bytes,
+                        'filename': new_filename,
+                        'mime_type': mime_types.get(target_ext, f'image/{target_ext}')
+                    })
+                    success_count += 1
+                
+                # ===== КОНВЕРТАЦИЯ ДОКУМЕНТОВ =====
+                elif conv_type == 'txt_to_pdf':
+                    if detected_type != 'txt':
+                        raise Exception(f"Файл {original_name} не является текстовым файлом.")
+                    
+                    txt_content = bytes(file_bytes).decode('utf-8', errors='ignore')
+                    converted_bytes = await convert_txt_to_pdf(txt_content)
+                    
+                    name_without_ext = original_name.rsplit('.', 1)[0] if '.' in original_name else original_name
+                    new_filename = f"{name_without_ext}_converted.pdf"
+                    
+                    converted_files.append({
+                        'bytes': converted_bytes,
+                        'filename': new_filename,
+                        'mime_type': 'application/pdf'
+                    })
+                    success_count += 1
+                
+                elif conv_type == 'pdf_to_txt':
+                    if detected_type != 'pdf':
+                        raise Exception(f"Файл {original_name} не является PDF.")
+                    
+                    txt_content = await convert_pdf_to_txt(bytes(file_bytes))
+                    converted_bytes = txt_content.encode('utf-8')
+                    
+                    name_without_ext = original_name.rsplit('.', 1)[0] if '.' in original_name else original_name
+                    new_filename = f"{name_without_ext}_info.txt"
+                    
+                    converted_files.append({
+                        'bytes': converted_bytes,
+                        'filename': new_filename,
+                        'mime_type': 'text/plain'
+                    })
+                    success_count += 1
+                
+                # ===== КОНВЕРТАЦИЯ ВИДЕО =====
+                elif conv_type in ['GIF_to_mp4', 'mp4_to_GIF', 'video_to_mp3', 'video_to_wav', 'video_to_flac']:
+                    # Проверка длительности для конвертации в GIF
+                    if conv_type == 'mp4_to_GIF' and hasattr(file_info, 'duration'):
+                        duration = file_info.get('duration', 0)
+                        if duration > MAX_GIF_DURATION:
+                            raise Exception(f"Видео слишком длинное для конвертации в GIF. Максимум: {MAX_GIF_DURATION} сек ({MAX_GIF_DURATION/60:.0f} мин)")
+                    
+                    await show_progress_bar(status_msg, idx, total_files, "Онлайн-конвертация...")
+                    
+                    converted_data = await convert_video_via_api(
+                        bytes(file_bytes), 
+                        conv_type, 
+                        original_name
+                    )
+                    converted_files.append(converted_data)
+                    success_count += 1
+                
+                await show_progress_bar(status_msg, idx, total_files, "Файл обработан")
+                
+            except Exception as e:
+                logger.error(f"Ошибка обработки файла {idx}: {e}")
+                await status_msg.reply_text(f"❌ Ошибка при обработке файла {idx}: {str(e)[:150]}")
+        
+        # ===== ОТПРАВКА РЕЗУЛЬТАТОВ =====
+        if converted_files:
+            sent_count = 0
+            for converted_file in converted_files:
+                try:
+                    mime_type = converted_file['mime_type']
+                    
+                    if mime_type.startswith('image/'):
+                        await application.bot.send_photo(
+                            chat_id=chat_id,
+                            photo=converted_file['bytes'],
+                            caption=f"✅ {converted_file['filename']}"
+                        )
+                    elif mime_type.startswith('audio/'):
+                        await application.bot.send_audio(
+                            chat_id=chat_id,
+                            audio=converted_file['bytes'],
+                            title=converted_file['filename'],
+                            filename=converted_file['filename']
+                        )
+                    elif mime_type.startswith('video/'):
+                        await application.bot.send_video(
+                            chat_id=chat_id,
+                            video=converted_file['bytes'],
+                            caption=f"✅ {converted_file['filename']}"
+                        )
+                    else:
+                        await application.bot.send_document(
+                            chat_id=chat_id,
+                            document=converted_file['bytes'],
+                            filename=converted_file['filename']
+                        )
+                    
+                    sent_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Ошибка отправки файла: {e}")
+                    await status_msg.reply_text(f"❌ Не удалось отправить файл: {str(e)[:100]}")
+            
+            duration = int((time.time() - start_time) * 1000)
+            db.log_conversion(
+                user_id,
+                user_info['type'],
+                user_info['source'],
+                user_info['target'],
+                sum(len(f.get('bytes', b'')) for f in converted_files),
+                True,
+                duration=duration
+            )
+            
+            await status_msg.edit_text(
+                f"✅ Конвертация завершена!\n\n"
+                f"📊 Успешно обработано: {sent_count}/{total_files} файлов\n"
+                f"📁 Формат: {user_info['source'].upper()} → {user_info['target'].upper()}\n"
+                f"⏱ Время: {duration/1000:.1f} сек"
+            )
+            
+            await show_main_menu_after_conversion(chat_id, user_id)
+        else:
+            await status_msg.edit_text("❌ Не удалось обработать файлы.")
+        
+    except Exception as e:
+        logger.error(f"Ошибка при обработке файлов: {e}")
+        await status_msg.edit_text(f"❌ Ошибка: {str(e)[:200]}")
+        
+        db.log_conversion(
+            user_id,
+            user_info['type'],
+            user_info['source'],
+            user_info['target'],
+            0,
+            False,
+            str(e)[:200],
+            int((time.time() - start_time) * 1000)
+        )
+    
+    finally:
+        async with processing_files_lock:
+            if user_id in processing_files:
+                del processing_files[user_id]
+        async with user_data_lock:
+            if user_id in user_data:
+                del user_data[user_id]
+
+async def show_main_menu_after_conversion(chat_id: int, user_id: int):
+    """Показ главного меню после конвертации"""
+    keyboard = [
+        [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+        [InlineKeyboardButton("📄 Документы (TXT↔PDF)", callback_data='category_documents')],
+        [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')],
+        [InlineKeyboardButton("👤 Мой профиль", callback_data='profile')],
+        [InlineKeyboardButton("❓ Помощь", callback_data='help')]
+    ]
+    
+    if user_id in ADMIN_IDS:
+        keyboard.append([InlineKeyboardButton("👑 Админ-панель", callback_data='admin_panel')])
+    
+    await application.bot.send_message(
+        chat_id=chat_id,
+        text="🔄 Конвертер файлов\n\nВыберите категорию для конвертации:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+# ==================== ОБРАБОТЧИКИ ФАЙЛОВ ====================
+
+@check_ban
+async def handle_documents(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка документов"""
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    async with user_data_lock:
+        if user_id not in user_data:
+            keyboard = [
+                [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+                [InlineKeyboardButton("📄 Документы", callback_data='category_documents')],
+                [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')]
+            ]
+            await update.message.reply_text(
+                "❌ Сначала выберите тип конвертации через меню.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        user_info = user_data[user_id]
+    
+    if len(user_info['files']) >= user_info['max_files']:
+        await update.message.reply_text(
+            f"❌ Достигнут максимум {user_info['max_files']} файлов.\n"
+            "Отправьте /convert для начала конвертации."
+        )
+        return
+    
+    if update.message.document:
+        document = update.message.document
+        
+        if document.file_size and document.file_size > user_info['max_size']:
+            max_mb = user_info['max_size'] // (1024 * 1024)
+            await update.message.reply_text(f"❌ Файл слишком большой. Максимум: {max_mb} МБ.")
+            return
+        
+        file_name = document.file_name.lower() if document.file_name else "document"
+        source_ext = user_info['source']
+        
+        allowed_extensions = {
+            'jpg': ['.jpg', '.jpeg', '.jpe', '.jfif'],
+            'png': ['.png'],
+            'webp': ['.webp'],
+            'GIF': ['.gif'],
+            'txt': ['.txt', '.text'],
+            'pdf': ['.pdf'],
+            'video': ['.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv']
+        }
+        
+        if source_ext in allowed_extensions:
+            if not any(file_name.endswith(ext) for ext in allowed_extensions[source_ext]):
+                await update.message.reply_text(
+                    f"❌ Неверный формат. Ожидается: {', '.join(allowed_extensions[source_ext])}"
+                )
+                return
+        
+        # Для видео проверяем длительность
+        if source_ext == 'video' and user_info['type'] == 'mp4_to_GIF':
+            duration = 0
+            if hasattr(document, 'duration') and document.duration:
+                duration = document.duration
+            elif hasattr(update.message.video, 'duration') and update.message.video:
+                duration = update.message.video.duration
+            
+            if duration > MAX_GIF_DURATION:
+                await update.message.reply_text(
+                    f"❌ Видео слишком длинное для конвертации в GIF.\n"
+                    f"Максимальная длительность: {MAX_GIF_DURATION} сек ({MAX_GIF_DURATION/60:.0f} мин)\n"
+                    f"Текущая длительность: {duration} сек"
+                )
+                return
+        
+        file_info = {
+            'file_id': document.file_id,
+            'file_name': document.file_name or f"file_{len(user_info['files']) + 1}.{source_ext}",
+            'file_size': document.file_size,
+            'mime_type': document.mime_type,
+            'message_id': update.message.message_id,
+            'duration': document.duration if hasattr(document, 'duration') else 0
+        }
+        
+        async with user_data_lock:
+            user_info['files'].append(file_info)
+        
+        remaining = user_info['max_files'] - len(user_info['files'])
+        
+        if remaining > 0:
+            message = (
+                f"✅ Файл добавлен!\n\n"
+                f"📦 Загружено: {len(user_info['files'])}/{user_info['max_files']}\n"
+                f"📝 Осталось мест: {remaining}\n\n"
+                f"📄 Файл: {os.path.basename(file_info['file_name'])}\n"
+                f"📏 Размер: {file_info['file_size'] / 1024:.1f} КБ\n\n"
+                f"Отправьте ещё файлы или нажмите кнопку для начала конвертации."
+            )
+        else:
+            message = (
+                f"✅ Файл добавлен!\n\n"
+                f"📦 Загружено: {len(user_info['files'])}/{user_info['max_files']}\n\n"
+                f"📊 Все файлы получены! Начинаю конвертацию..."
+            )
+        
+        keyboard = [
+            [InlineKeyboardButton("🚀 Начать конвертацию", callback_data='start_conversion')],
+            [InlineKeyboardButton("❌ Отменить", callback_data='back_to_category')]
+        ] if remaining > 0 else []
+        
+        await update.message.reply_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+        )
+        
+        if remaining == 0:
+            await convert_command(update, context)
+
+@check_ban
+async def handle_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка фотографий"""
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    async with user_data_lock:
+        if user_id not in user_data:
+            keyboard = [
+                [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+                [InlineKeyboardButton("📄 Документы", callback_data='category_documents')],
+                [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')]
+            ]
+            await update.message.reply_text(
+                "❌ Сначала выберите тип конвертации через меню.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        user_info = user_data[user_id]
+    
+    if user_info['source'] not in ['jpg', 'png', 'webp', 'GIF']:
+        await update.message.reply_text(
+            "❌ Вы выбрали не изображение. Используйте раздел 'Изображения' в меню.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📸 Изображения", callback_data='category_images')]
+            ])
+        )
+        return
+    
+    if len(user_info['files']) >= user_info['max_files']:
+        await update.message.reply_text(
+            f"❌ Достигнут максимум {user_info['max_files']} файлов.\n"
+            "Отправьте /convert для начала конвертации."
+        )
+        return
+    
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        
+        if photo.file_size and photo.file_size > user_info['max_size']:
+            max_mb = user_info['max_size'] // (1024 * 1024)
+            await update.message.reply_text(f"❌ Фото слишком большое. Максимум: {max_mb} МБ.")
+            return
+        
+        file_info = {
+            'file_id': photo.file_id,
+            'file_name': f"photo_{len(user_info['files']) + 1}.jpg",
+            'file_size': photo.file_size,
+            'mime_type': 'image/jpeg',
+            'message_id': update.message.message_id
+        }
+        
+        async with user_data_lock:
+            user_info['files'].append(file_info)
+        
+        remaining = user_info['max_files'] - len(user_info['files'])
+        
+        if remaining > 0:
+            message = (
+                f"✅ Фото добавлено!\n\n"
+                f"📦 Загружено: {len(user_info['files'])}/{user_info['max_files']}\n"
+                f"📸 Осталось мест: {remaining}\n\n"
+                f"Отправьте ещё фото или нажмите кнопку для начала конвертации."
+            )
+        else:
+            message = (
+                f"✅ Фото добавлено!\n\n"
+                f"📦 Загружено: {len(user_info['files'])}/{user_info['max_files']}\n\n"
+                f"📊 Все фото получены! Начинаю конвертацию..."
+            )
+        
+        keyboard = [
+            [InlineKeyboardButton("🚀 Начать конвертацию", callback_data='start_conversion')],
+            [InlineKeyboardButton("❌ Отменить", callback_data='back_to_category')]
+        ] if remaining > 0 else []
+        
+        await update.message.reply_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard) if keyboard else None
+        )
+        
+        if remaining == 0:
+            await convert_command(update, context)
+
+@check_ban
+async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка видео"""
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    async with user_data_lock:
+        if user_id not in user_data:
+            keyboard = [
+                [InlineKeyboardButton("📸 Изображения", callback_data='category_images')],
+                [InlineKeyboardButton("📄 Документы", callback_data='category_documents')],
+                [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')]
+            ]
+            await update.message.reply_text(
+                "❌ Сначала выберите тип конвертации через меню.",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        user_info = user_data[user_id]
+    
+    if user_info['type'] not in ['mp4_to_GIF', 'video_to_mp3', 'video_to_wav', 'video_to_flac']:
+        await update.message.reply_text(
+            "❌ Вы выбрали не видео. Используйте раздел 'Видео/Аудио' в меню.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎬 Видео/Аудио", callback_data='category_video')]
+            ])
+        )
+        return
+    
+    if len(user_info['files']) >= user_info['max_files']:
+        await update.message.reply_text(f"❌ Максимум {user_info['max_files']} файлов.")
+        return
+    
+    if update.message.video:
+        video = update.message.video
+        
+        # Проверка длительности для конвертации в GIF (до 4 минут)
+        if user_info['type'] == 'mp4_to_GIF' and video.duration and video.duration > MAX_GIF_DURATION:
+            await update.message.reply_text(
+                f"❌ Видео слишком длинное для конвертации в GIF.\n"
+                f"Максимальная длительность: {MAX_GIF_DURATION} сек ({MAX_GIF_DURATION/60:.0f} мин)\n"
+                f"Текущая длительность: {video.duration} сек"
+            )
+            return
+        
+        if video.file_size and video.file_size > user_info['max_size']:
+            max_mb = user_info['max_size'] // (1024 * 1024)
+            await update.message.reply_text(f"❌ Видео слишком большое. Максимум: {max_mb} МБ.")
+            return
+        
+        file_info = {
+            'file_id': video.file_id,
+            'file_name': video.file_name or f"video_{len(user_info['files']) + 1}.mp4",
+            'file_size': video.file_size,
+            'mime_type': video.mime_type,
+            'message_id': update.message.message_id,
+            'duration': video.duration
+        }
+        
+        async with user_data_lock:
+            user_info['files'].append(file_info)
+        
+        size_mb = video.file_size / (1024 * 1024) if video.file_size else 0
+        duration_text = f"{video.duration} сек" if video.duration else "неизвестно"
+        
+        message = (
+            f"✅ Видео добавлено!\n\n"
+            f"📹 Размер: {size_mb:.1f} МБ\n"
+            f"⏱ Длительность: {duration_text}\n"
+            f"🌐 Будет использоваться онлайн-конвертация\n\n"
+            f"Отправьте /convert для начала конвертации."
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🚀 Начать конвертацию", callback_data='start_conversion')],
+            [InlineKeyboardButton("❌ Отменить", callback_data='back_to_category')]
+        ]
+        
+        await update.message.reply_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+@check_ban
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка текстовых команд"""
+    user_id = update.effective_user.id
+    db.update_activity(user_id)
+    
+    text = update.message.text.lower().strip()
+    
+    text_commands = {
+        'готово': 'convert',
+        'конвертировать': 'convert',
+        'start': 'convert',
+        'go': 'convert',
+        'convert': 'convert',
+        'начать': 'convert',
+        'старт': 'convert',
+        'отмена': 'cancel',
+        'cancel': 'cancel',
+        'стоп': 'cancel',
+        'stop': 'cancel',
+        'помощь': 'help',
+        'help': 'help',
+        'справка': 'help',
+        'меню': 'start',
+        'menu': 'start',
+        'начать сначала': 'start',
+        'профиль': 'profile',
+        'profile': 'profile'
+    }
+    
+    if text in text_commands:
+        command = text_commands[text]
+        if command == 'convert':
+            await convert_command(update, context)
+        elif command == 'cancel':
+            await cancel(update, context)
+        elif command == 'help':
+            await help_command(update, context)
+        elif command == 'start':
+            await start(update, context)
+        elif command == 'profile':
+            await profile_command(update, context)
+
+# ==================== ЗАПУСК БОТА ====================
+
+def main():
+    """Главная функция запуска бота"""
+    global application
+    
+    application = Application.builder().token(TOKEN).build()
+    
+    # Регистрируем обработчики команд
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("convert", convert_command))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("profile", profile_command))
+    
+    # Регистрируем обработчики callback и сообщений
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photos))
+    application.add_handler(MessageHandler(filters.Document.ALL, handle_documents))
+    application.add_handler(MessageHandler(filters.VIDEO, handle_video))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    
+    logger.info("🚀 Бот запущен и готов к работе!")
+    logger.info(f"👑 Администраторы: {ADMIN_IDS}")    
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
